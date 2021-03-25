@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -12,8 +14,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	rand2 "math/rand"
 	"os"
-	"strings"
+	"time"
 )
 
 func main() {
@@ -54,10 +57,6 @@ func encFile(path string) (err error) {
 	publicData, err = os.ReadFile(publicFile)
 	if err != nil {
 		err = genRsaKey()
-		if err != nil {
-			return
-		}
-		publicData, err = os.ReadFile(publicFile)
 		if err != nil {
 			return
 		}
@@ -122,25 +121,14 @@ func decFile(path string) (err error) {
 	}
 	defer fw.Close()
 
-	var (
-		tmp    = []byte{0}
-		encKey = new(strings.Builder)
-	)
-	for {
-		_, err = fr.Read(tmp)
-		if err != nil {
-			if err != io.EOF {
-				break
-			}
-			return err
-		}
-		if tmp[0] == 0 {
-			break /* 读取第一个为0字符前面的字符串 */
-		}
-		encKey.WriteByte(tmp[0])
+	br := bufio.NewReader(fr)
+	encKey, err := br.ReadString(0)
+	if err != nil {
+		return
 	}
 
-	key, err := rsaDecrypt(encKey.String())
+	// 密文需要去掉最后的0
+	key, err := rsaDecrypt(encKey[:len(encKey)-1])
 	if err != nil {
 		return
 	}
@@ -150,19 +138,23 @@ func decFile(path string) (err error) {
 		return
 	}
 
-	_, err = io.Copy(encMode, fr)
+	_, err = io.Copy(encMode, br)
 	return
 }
 
 const (
 	privateFile = "private.key"
 	publicFile  = "public.key"
-	rsaBits     = 1024
 )
 
 // 生成rsa公钥和私钥
 func genRsaKey() error {
-	privateKey, err := rsa.GenerateKey(rand.Reader, rsaBits)
+	rand2.Seed(time.Now().UnixNano())
+
+	// 经测试,要加密32字节数据最少需要337bits
+	// 因此按照如下随机一个长度,使rsa公私钥长度也随机
+	bits := rand2.Intn(200) + 337
+	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
 	if err != nil {
 		return err
 	}
@@ -191,12 +183,13 @@ func genRsaKey() error {
 		Type:  "PUBLIC KEY",
 		Bytes: derPkix,
 	}
-	fwPub, err := os.Create(publicFile)
+	data := new(bytes.Buffer)
+	err = pem.Encode(data, block)
 	if err != nil {
 		return err
 	}
-	defer fwPub.Close()
-	return pem.Encode(fwPub, block)
+	publicData = data.Bytes() // 保存公钥数据
+	return os.WriteFile(publicFile, publicData, 0666)
 }
 
 // 加密
