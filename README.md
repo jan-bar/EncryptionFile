@@ -5,12 +5,16 @@
 > 加密文件只需要提供可执行程序和公钥  
 > 解密文件只需要提供可执行程序和私钥  
 > 即使同一个文件每次加密结果都不一样,安全系数极高  
+> 可以指定计算hash方法,最终会在头部存入hash值、rsa加密密文  
+
+文件内容  
+![](details.png)
 
 ## 使用方法
-加密：`go run EncryptionFile.go -enc EncryptionFile.go`  
+加密：`go run EncryptionFile.go -enc EncryptionFile.go -mod sha256`  
 会产生`EncryptionFile.go.dst`的加密文件  
 
-解密：`go run EncryptionFile.go -dec EncryptionFile.go.dst`  
+解密：`go run EncryptionFile.go -dec EncryptionFile.go.dst -mod sha256`  
 会产生`EncryptionFile.go.dst.src`的解密文件  
 
 执行：`diff EncryptionFile.go.dst.src EncryptionFile.go`  

@@ -5,14 +5,19 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
+	"hash"
+	"hash/crc32"
 	"io"
 	rand2 "math/rand"
 	"os"
@@ -22,6 +27,7 @@ import (
 func main() {
 	enc := flag.String("enc", "", "enc file")
 	dec := flag.String("dec", "", "dec file")
+	mod := flag.String("mod", "md5", "md5,sha1,sha256,crc32")
 	flag.Parse()
 
 	// 运行时只处理一种模式
@@ -30,13 +36,23 @@ func main() {
 		return
 	}
 
-	err := encFile(*enc)
+	h, ok := map[string]hash.Hash{
+		"md5":    md5.New(),
+		"sha1":   sha1.New(),
+		"sha256": sha256.New(),
+		"crc32":  crc32.NewIEEE(),
+	}[*mod]
+	if !ok {
+		h = md5.New()
+	}
+
+	err := encFile(*enc, h)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
-	err = decFile(*dec)
+	err = decFile(*dec, h)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -49,7 +65,7 @@ var (
 	myBase64 = base64.NewEncoding("Ajk3Zdmw4UVWYg5EIO7MQey9-FGv6_BNflq2CzHT08LSacbnrPptxDJXiuKRh1os").WithPadding(base64.NoPadding)
 )
 
-func encFile(path string) (err error) {
+func encFile(path string, h hash.Hash) (err error) {
 	if path == "" {
 		return
 	}
@@ -85,21 +101,39 @@ func encFile(path string) (err error) {
 		return
 	}
 
+	// 预留保存hash值位置,多一个\x00结束符位置
+	_, err = fw.Write(make([]byte, 1+myBase64.EncodedLen(h.Size())))
+	if err != nil {
+		return
+	}
+
+	// 将密钥密文存入文件
 	_, err = fw.WriteString(encKey + "\x00")
 	if err != nil {
 		return
 	}
 
-	encMode, err := newMyAes(key, aesEnc, fw)
+	encMode, err := newMyAes(key, aesEnc, h, fw)
 	if err != nil {
 		return
 	}
 
 	_, err = io.Copy(encMode, fr)
+
+	err = fw.Sync() /* 刷新文件 */
+	if err != nil {
+		return
+	}
+	_, err = fw.Seek(0, io.SeekStart)
+	if err != nil {
+		return
+	}
+	/* 将hash写入头部 */
+	_, err = fw.WriteString(myBase64.EncodeToString(encMode.sum()))
 	return
 }
 
-func decFile(path string) (err error) {
+func decFile(path string, h hash.Hash) (err error) {
 	if path == "" {
 		return
 	}
@@ -122,26 +156,96 @@ func decFile(path string) (err error) {
 	defer fw.Close()
 
 	br := bufio.NewReader(fr)
-	encKey, err := br.ReadString(0)
+
+	tmpData, err := br.ReadString(0)
+	if err != nil {
+		return
+	}
+	sum, err := myBase64.DecodeString(tmpData[:len(tmpData)-1])
 	if err != nil {
 		return
 	}
 
-	// 密文需要去掉最后的0
-	key, err := rsaDecrypt(encKey[:len(encKey)-1])
+	tmpData, err = br.ReadString(0)
+	if err != nil {
+		return
+	}
+	key, err := rsaDecrypt(tmpData[:len(tmpData)-1])
 	if err != nil {
 		return
 	}
 
-	encMode, err := newMyAes(key, aesDec, fw)
+	encMode, err := newMyAes(key, aesDec, h, fw)
 	if err != nil {
 		return
 	}
 
 	_, err = io.Copy(encMode, br)
-	return
+	if err != nil {
+		return
+	}
+	err = fw.Sync()
+	if err != nil {
+		return
+	}
+	// 计算hash结果与文件头的进行比较,不相等表示文件被篡改
+	if 0 != bytes.Compare(sum, encMode.sum()) {
+		return errors.New("file hash not match")
+	}
+	return nil
 }
 
+type (
+	myAes struct {
+		buf    []byte
+		w      io.Writer
+		h      hash.Hash
+		mode   myAesMode
+		stream cipher.Stream
+	}
+	myAesMode byte
+)
+
+const (
+	aesEnc myAesMode = iota
+	aesDec
+)
+
+func newMyAes(key []byte, mode myAesMode, h hash.Hash, w io.Writer) (*myAes, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	res := &myAes{w: w, h: h, mode: mode, buf: make([]byte, 32*1024)}
+	if mode == aesEnc {
+		res.stream = cipher.NewCFBEncrypter(block, key[:block.BlockSize()])
+	} else {
+		res.stream = cipher.NewCFBDecrypter(block, key[:block.BlockSize()])
+	}
+	return res, nil
+}
+
+func (aes *myAes) Write(p []byte) (int, error) {
+	buf := aes.buf // 使用缓存
+	if n := len(p); n > len(buf) {
+		buf = make([]byte, n)
+	} else {
+		buf = buf[:n]
+	}
+	aes.stream.XORKeyStream(buf, p)
+	if aes.mode == aesEnc {
+		aes.h.Write(p) /* 加密前源文件计算hash */
+	} else {
+		aes.h.Write(buf) /* 解密后源文件计算hash */
+	}
+	return aes.w.Write(buf)
+}
+
+func (aes *myAes) sum() []byte {
+	return aes.h.Sum(nil)
+}
+
+/* rsa相关 */
 const (
 	privateFile = "private.key"
 	publicFile  = "public.key"
@@ -224,43 +328,4 @@ func rsaDecrypt(cipherText string) ([]byte, error) {
 		return nil, err
 	}
 	return rsa.DecryptPKCS1v15(rand.Reader, prIv, data)
-}
-
-type (
-	myAes struct {
-		buf    []byte
-		w      io.Writer
-		stream cipher.Stream
-	}
-	myAesMode byte
-)
-
-const (
-	aesEnc myAesMode = iota
-	aesDec
-)
-
-func newMyAes(key []byte, mode myAesMode, w io.Writer) (io.Writer, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	res := &myAes{w: w, buf: make([]byte, 32*1024)}
-	if mode == aesEnc {
-		res.stream = cipher.NewCFBEncrypter(block, key[:block.BlockSize()])
-	} else {
-		res.stream = cipher.NewCFBDecrypter(block, key[:block.BlockSize()])
-	}
-	return res, nil
-}
-
-func (aes *myAes) Write(p []byte) (int, error) {
-	buf := aes.buf // 使用缓存
-	if n := len(p); n > len(buf) {
-		buf = make([]byte, n)
-	} else {
-		buf = buf[:n]
-	}
-	aes.stream.XORKeyStream(buf, p)
-	return aes.w.Write(buf)
 }
