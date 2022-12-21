@@ -1,263 +1,201 @@
-package main
+package EncryptionFile
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha1"
-	"crypto/sha256"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/pem"
 	"errors"
-	"flag"
-	"fmt"
 	"hash"
-	"hash/crc32"
 	"io"
-	rand2 "math/rand"
-	"os"
-	"time"
 )
 
-func main() {
-	enc := flag.String("enc", "", "enc file")
-	dec := flag.String("dec", "", "dec file")
-	mod := flag.String("mod", "md5", "md5,sha1,sha256,crc32")
-	flag.Parse()
+const bufLen = 32 * 1024 // 同io.Copy里面的默认长度
 
-	// 运行时只处理一种模式
-	if (*enc == "") == (*dec == "") {
-		flag.Usage()
-		return
-	}
-
-	h, ok := map[string]hash.Hash{
-		"md5":    md5.New(),
-		"sha1":   sha1.New(),
-		"sha256": sha256.New(),
-		"crc32":  crc32.NewIEEE(),
-	}[*mod]
-	if !ok {
-		h = md5.New()
-	}
-
-	err := encFile(*enc, h)
+// EncData
+//  @Description: 加密数据
+//  @param r      数据来源读出流
+//  @param w      加密数据写入流
+//  @param pubKey 公钥数据
+//  @param h      指定hash校验方法
+//  @return error 返回错误
+func EncData(r io.Reader, w io.Writer, pubKey []byte, h hash.Hash) error {
+	tmp := make([]byte, bufLen)
+	_, err := rand.Read(tmp[:32])
 	if err != nil {
-		fmt.Println(err)
-		return
+		return err
 	}
 
-	err = decFile(*dec, h)
+	encKey, err := RsaEncrypt(pubKey, tmp[:32])
 	if err != nil {
-		fmt.Println(err)
-		return
+		return err
 	}
+
+	n := len(encKey) // 将rsa密文长度和rsa密文写入头部
+	head := append(tmp[32:32], byte(n), byte(n>>8))
+	head = append(head, encKey...)
+	_, err = w.Write(head)
+	if err != nil {
+		return err
+	}
+
+	aw, err := newAesEnc(tmp[:32], h, nil, w)
+	if err != nil {
+		return err
+	}
+
+	// 将内容使用aes进行加密并写入
+	_, err = copyBuffer(aw, r, tmp)
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Write(aw.sum()) // 最后写入内容hash值
+	return err
 }
 
-var (
-	privateData, publicData []byte
-	// 随机生成base64字符编码,稍微增加解码难度
-	myBase64 = base64.NewEncoding("Ajk3Zdmw4UVWYg5EIO7MQey9-FGv6_BNflq2CzHT08LSacbnrPptxDJXiuKRh1os").WithPadding(base64.NoPadding)
-)
-
-func encFile(path string, h hash.Hash) (err error) {
-	if path == "" {
-		return
-	}
-
-	publicData, err = os.ReadFile(publicFile)
+// DecData
+//  @Description:  解密数据
+//  @param r       密文数据读入流
+//  @param w       解密后数据写入流
+//  @param priKey  私钥数据
+//  @param h       指定hash校验方法
+//  @return error  返回错误
+func DecData(r io.Reader, w io.Writer, priKey []byte, h hash.Hash) error {
+	var (
+		br  = bufio.NewReader(r)
+		tmp = make([]byte, bufLen)
+	)
+	_, err := io.ReadFull(br, tmp[:2])
 	if err != nil {
-		err = genRsaKey()
-		if err != nil {
-			return
-		}
+		return err
 	}
 
-	fr, err := os.Open(path)
-	if err != nil {
-		return
+	n := int(tmp[0]) | int(tmp[1])<<8
+	if n > bufLen {
+		// 正常数据基本不会出错,这里防止异常数据时返回错误
+		return errors.New("len(rsa) out of index")
 	}
-	defer fr.Close()
-
-	fw, err := os.Create(path + ".dst")
+	// 根据rsa长度读取rsa密文
+	_, err = io.ReadFull(br, tmp[:n])
 	if err != nil {
-		return
-	}
-	defer fw.Close()
-
-	key := make([]byte, 32)
-	_, err = rand.Read(key)
-	if err != nil {
-		return
+		return err
 	}
 
-	encKey, err := rsaEncrypt(key)
+	key, err := RsaDecrypt(priKey, tmp[:n])
 	if err != nil {
-		return
+		return err
 	}
 
-	// 预留保存hash值位置,多一个\x00结束符位置
-	_, err = fw.Write(make([]byte, 1+myBase64.EncodedLen(h.Size())))
+	ar, err := newAesEnc(key, h, br, nil)
 	if err != nil {
-		return
+		return err
 	}
 
-	// 将密钥密文存入文件
-	_, err = fw.WriteString(encKey + "\x00")
+	// 使用aes解密,并写入w
+	_, err = copyBuffer(w, ar, tmp)
 	if err != nil {
-		return
+		return err
 	}
 
-	encMode, err := newMyAes(key, aesEnc, h, fw)
-	if err != nil {
-		return
-	}
-
-	_, err = io.Copy(encMode, fr)
-
-	err = fw.Sync() /* 刷新文件 */
-	if err != nil {
-		return
-	}
-	_, err = fw.Seek(0, io.SeekStart)
-	if err != nil {
-		return
-	}
-	/* 将hash写入头部 */
-	_, err = fw.WriteString(myBase64.EncodeToString(encMode.sum()))
-	return
-}
-
-func decFile(path string, h hash.Hash) (err error) {
-	if path == "" {
-		return
-	}
-
-	privateData, err = os.ReadFile(privateFile)
-	if err != nil {
-		return /* 私钥不存在,需要执行加密流程创建 */
-	}
-
-	fr, err := os.Open(path)
-	if err != nil {
-		return
-	}
-	defer fr.Close()
-
-	fw, err := os.Create(path + ".src")
-	if err != nil {
-		return
-	}
-	defer fw.Close()
-
-	br := bufio.NewReader(fr)
-
-	tmpData, err := br.ReadString(0)
-	if err != nil {
-		return
-	}
-	sum, err := myBase64.DecodeString(tmpData[:len(tmpData)-1])
-	if err != nil {
-		return
-	}
-
-	tmpData, err = br.ReadString(0)
-	if err != nil {
-		return
-	}
-	key, err := rsaDecrypt(tmpData[:len(tmpData)-1])
-	if err != nil {
-		return
-	}
-
-	encMode, err := newMyAes(key, aesDec, h, fw)
-	if err != nil {
-		return
-	}
-
-	_, err = io.Copy(encMode, br)
-	if err != nil {
-		return
-	}
-	err = fw.Sync()
-	if err != nil {
-		return
-	}
-	// 计算hash结果与文件头的进行比较,不相等表示文件被篡改
-	if 0 != bytes.Compare(sum, encMode.sum()) {
+	if ar.sumDiff() {
 		return errors.New("file hash not match")
 	}
 	return nil
 }
 
-type (
-	myAes struct {
-		buf    []byte
-		w      io.Writer
-		h      hash.Hash
-		mode   myAesMode
-		stream cipher.Stream
-	}
-	myAesMode byte
-)
+// -----------------------------------------------------------------------------
 
-const (
-	aesEnc myAesMode = iota
-	aesDec
-)
+type aesEncDec struct {
+	r *bufio.Reader
+	w io.Writer
 
-func newMyAes(key []byte, mode myAesMode, h hash.Hash, w io.Writer) (*myAes, error) {
+	hash  hash.Hash
+	hSize int
+	hCrc  []byte
+
+	stream cipher.Stream
+}
+
+func newAesEnc(key []byte, h hash.Hash, r *bufio.Reader, w io.Writer) (*aesEncDec, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
-	res := &myAes{w: w, h: h, mode: mode, buf: make([]byte, 32*1024)}
-	if mode == aesEnc {
-		res.stream = cipher.NewCFBEncrypter(block, key[:block.BlockSize()])
-	} else {
-		res.stream = cipher.NewCFBDecrypter(block, key[:block.BlockSize()])
+	iv := key[:block.BlockSize()]
+
+	if r != nil {
+		return &aesEncDec{hash: h, r: r, hSize: h.Size(),
+			stream: cipher.NewCFBDecrypter(block, iv),
+		}, nil
 	}
-	return res, nil
+
+	return &aesEncDec{hash: h, w: w,
+		stream: cipher.NewCFBEncrypter(block, iv),
+	}, nil
 }
 
-func (aes *myAes) Write(p []byte) (int, error) {
-	buf := aes.buf // 使用缓存
-	if n := len(p); n > len(buf) {
-		buf = make([]byte, n)
-	} else {
-		buf = buf[:n]
-	}
-	aes.stream.XORKeyStream(buf, p)
-	if aes.mode == aesEnc {
-		aes.h.Write(p) /* 加密前源文件计算hash */
-	} else {
-		aes.h.Write(buf) /* 解密后源文件计算hash */
-	}
-	return aes.w.Write(buf)
+func (aes *aesEncDec) Write(p []byte) (int, error) {
+	aes.hash.Write(p) // 计算加密前的源文件hash
+	aes.stream.XORKeyStream(p, p)
+	return aes.w.Write(p)
 }
 
-func (aes *myAes) sum() []byte {
-	return aes.h.Sum(nil)
+func (aes *aesEncDec) Read(p []byte) (n int, err error) {
+	n, err = aes.r.Read(p)
+	if err == nil {
+		aes.hCrc, err = aes.r.Peek(aes.hSize)
+		if err != nil {
+			// Peek只有读n个字节才会返回成功,只有少于n个字节才会报错
+			// 因此上次Peek成功,则说明缓存一定有n个字节可读
+			// 因为 (len(p)=32*1024) > aes.hSize ,本次Read一定包含上次Peek内容
+			// 本次Peek失败,说明读取到io.EOF结束标记,本次读取就完成了所有读取
+			// 此时(p + aes.hCrc)共同组成包含crc内容的最后一次处理数据
+			// len(aes.hCrc) == aes.hSize时err==nil,会多走一次循环,下次才会到这里
+			// 因此err!=nil时必定存在关系: 0 <= len(aes.hCrc) < aes.hSize
+			// 下面就组装crc内容,并设置n使之继续解密crc之前的数据
+			// 本注释用于说明io.Reader接口读取时一定可以得到最后aes.hSize数据
+			// 如果异常数据,则aes.hCrc一定不正常,sumDiff会确保长度和内容正确
+			lc := n - aes.hSize + len(aes.hCrc)
+			aes.hCrc = append(p[lc:n], aes.hCrc...)
+			n = lc
+		}
+		if n > 0 {
+			aes.stream.XORKeyStream(p, p[:n])
+			aes.hash.Write(p[:n]) // 解密并写入hash流
+		}
+	}
+	return
 }
 
-/* rsa相关 */
-const (
-	privateFile = "private.key"
-	publicFile  = "public.key"
-)
+// 加密时返回计算源文件的hash值
+func (aes *aesEncDec) sum() []byte { return aes.hash.Sum(nil) }
 
-// 生成rsa公钥和私钥
-func genRsaKey() error {
-	rand2.Seed(time.Now().UnixNano())
+// 解密时判断计算的hash和读出的hash是否不同
+func (aes *aesEncDec) sumDiff() bool {
+	crc := aes.hash.Sum(nil)
+	if len(crc) == len(aes.hCrc) {
+		for i, v := range crc {
+			if aes.hCrc[i] != v {
+				return true
+			}
+		}
+	}
+	return false
+}
 
-	// 经测试,要加密32字节数据最少需要337bits
-	// 因此按照如下随机一个长度,使rsa公私钥长度也随机
-	bits := rand2.Intn(200) + 337
+// -----------------------------------------------------------------------------
+
+// GenRsaKey
+//  @Description: 生成rsa公私钥对
+//  @param bits   生成位数
+//  @param pub    公钥写入流
+//  @param pri    私钥写入流
+//  @return error 返回错误
+func GenRsaKey(bits int, pub, pri io.Writer) error {
 	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
 	if err != nil {
 		return err
@@ -267,13 +205,8 @@ func genRsaKey() error {
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
 	}
-	fwPri, err := os.Create(privateFile)
-	if err != nil {
-		return err
-	}
-	defer fwPri.Close()
 
-	err = pem.Encode(fwPri, block)
+	err = pem.Encode(pri, block)
 	if err != nil {
 		return err
 	}
@@ -287,35 +220,35 @@ func genRsaKey() error {
 		Type:  "PUBLIC KEY",
 		Bytes: derPkix,
 	}
-	data := new(bytes.Buffer)
-	err = pem.Encode(data, block)
-	if err != nil {
-		return err
-	}
-	publicData = data.Bytes() // 保存公钥数据
-	return os.WriteFile(publicFile, publicData, 0666)
+	return pem.Encode(pub, block)
 }
 
-// 加密
-func rsaEncrypt(origData []byte) (string, error) {
-	block, _ := pem.Decode(publicData)
+// RsaEncrypt
+//  @Description:   rsa加密逻辑
+//  @param pubKey    公钥数据
+//  @param origData  待加密数据
+//  @return []byte   返回加密后数据
+//  @return error    返回错误
+func RsaEncrypt(pubKey, origData []byte) ([]byte, error) {
+	block, _ := pem.Decode(pubKey)
 	if block == nil {
-		return "", errors.New("public key error")
+		return nil, errors.New("public key error")
 	}
 	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	data, err := rsa.EncryptPKCS1v15(rand.Reader, pub.(*rsa.PublicKey), origData)
-	if err != nil {
-		return "", err
-	}
-	return myBase64.EncodeToString(data), nil
+	return rsa.EncryptPKCS1v15(rand.Reader, pub.(*rsa.PublicKey), origData)
 }
 
-// 解密
-func rsaDecrypt(cipherText string) ([]byte, error) {
-	block, _ := pem.Decode(privateData)
+// RsaDecrypt
+//  @Description:     rsa解密逻辑
+//  @param priKey     私钥数据
+//  @param cipherText 密文
+//  @return []byte    解密后数据
+//  @return error     返回错误
+func RsaDecrypt(priKey, cipherText []byte) ([]byte, error) {
+	block, _ := pem.Decode(priKey)
 	if block == nil {
 		return nil, errors.New("private key error")
 	}
@@ -323,9 +256,41 @@ func rsaDecrypt(cipherText string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := myBase64.DecodeString(cipherText)
-	if err != nil {
-		return nil, err
+	return rsa.DecryptPKCS1v15(rand.Reader, prIv, cipherText)
+}
+
+// copy io.copyBuffer ,去掉不需要的判断和类型断言
+func copyBuffer(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
+	var (
+		nr, nw int
+		er, ew error
+	)
+	for {
+		nr, er = src.Read(buf)
+		if nr > 0 {
+			nw, ew = dst.Write(buf[:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = errors.New("invalid write result")
+				}
+			}
+			written += int64(nw)
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
 	}
-	return rsa.DecryptPKCS1v15(rand.Reader, prIv, data)
+	return written, err
 }
