@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/rand"
+	"io"
 	"log"
 	"testing"
 )
@@ -25,11 +26,12 @@ func TestEnc(t *testing.T) {
 		h      = md5.New()
 		priKey = make([]byte, tmpBuf1.Len())
 		pubKey = make([]byte, tmpBuf0.Len())
+		lr     = new(limitReader)
 	)
 	// 生成一对用于测试的公私钥
 	copy(priKey, tmpBuf1.Bytes())
 	copy(pubKey, tmpBuf0.Bytes())
-	for i := 0; i < bufLen2; i++ {
+	for i := 1; i < bufLen2; i++ {
 		// 循环测试任意长度的数据加解密,该长度覆盖 *bufio.Reader 默认 4096 长度
 		// 也要覆盖 bufLen 的长度,因此这里取 2 * bufLen ,充分测试各种长度数据
 		// 测试数据使用随机值,多次测试通过才确保该算法没有问题
@@ -48,8 +50,9 @@ func TestEnc(t *testing.T) {
 		}
 
 		tmpBuf0.Reset()
-		h.Reset() // 解密实际上也会校验hash是否一致
-		err = DecData(tmpBuf1, tmpBuf0, priKey, h)
+		h.Reset()
+		lr.n, lr.r = i, tmpBuf1
+		err = DecData(lr, tmpBuf0, priKey, h)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -59,4 +62,17 @@ func TestEnc(t *testing.T) {
 			t.Fatal("dec(data) != tmp[:i]")
 		}
 	}
+}
+
+type limitReader struct {
+	n int
+	r io.Reader
+}
+
+func (l *limitReader) Read(p []byte) (int, error) {
+	if l.n < len(p) {
+		// 限定每次读取个数,用于测试 Read + Peek 组合不会出现问题
+		return l.r.Read(p[:l.n])
+	}
+	return l.r.Read(p)
 }
