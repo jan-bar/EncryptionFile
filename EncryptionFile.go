@@ -24,27 +24,32 @@ const bufLen = 32 * 1024 // 同io.Copy里面的默认长度
 //  @return error 返回错误
 func EncData(r io.Reader, w io.Writer, pubKey []byte, h hash.Hash) error {
 	tmp := make([]byte, bufLen)
-	_, err := rand.Read(tmp[:32])
+
+	const aesKeyIvLen = aes.BlockSize + 32
+	_, err := rand.Read(tmp[:aesKeyIvLen])
 	if err != nil {
 		return err
 	}
 
-	encKey, err := RsaEncrypt(pubKey, tmp[:32])
+	encKey, err := RsaEncrypt(pubKey, tmp[:aesKeyIvLen])
 	if err != nil {
 		return err
 	}
 
 	n := len(encKey) // 将rsa密文长度和rsa密文写入头部
-	head := append(tmp[32:32], byte(n), byte(n>>8))
+	head := append(tmp[aesKeyIvLen:aesKeyIvLen], byte(n), byte(n>>8))
 	head = append(head, encKey...)
 	_, err = w.Write(head)
 	if err != nil {
 		return err
 	}
 
-	aw, err := newAesEnc(tmp[:32], h, nil, w)
+	block, err := aes.NewCipher(tmp[:32])
 	if err != nil {
 		return err
+	}
+	aw := &aesEncDec{hash: h, w: w,
+		stream: cipher.NewCFBEncrypter(block, tmp[32:aesKeyIvLen]),
 	}
 
 	// 将内容使用aes进行加密并写入
@@ -53,6 +58,9 @@ func EncData(r io.Reader, w io.Writer, pubKey []byte, h hash.Hash) error {
 		return err
 	}
 
+	// hash值为加密后数据的hash,这样可以保证每次hash值都会变化
+	// 上一版是加密前数据的hash,这样可以穷举aes的key+iv计算和hash匹配就能完成破解
+	// 所以使用加密后数据计算hash是最合理的方式
 	_, err = w.Write(aw.sum()) // 最后写入内容hash值
 	return err
 }
@@ -90,9 +98,12 @@ func DecData(r io.Reader, w io.Writer, priKey []byte, h hash.Hash) error {
 		return err
 	}
 
-	ar, err := newAesEnc(key, h, br, nil)
+	block, err := aes.NewCipher(key[:32])
 	if err != nil {
 		return err
+	}
+	ar := &aesEncDec{hash: h, r: br, hSize: h.Size(),
+		stream: cipher.NewCFBDecrypter(block, key[32:]),
 	}
 
 	// 使用aes解密,并写入w
@@ -120,28 +131,13 @@ type aesEncDec struct {
 	stream cipher.Stream
 }
 
-func newAesEnc(key []byte, h hash.Hash, r *bufio.Reader, w io.Writer) (*aesEncDec, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	iv := key[:block.BlockSize()]
-
-	if r != nil {
-		return &aesEncDec{hash: h, r: r, hSize: h.Size(),
-			stream: cipher.NewCFBDecrypter(block, iv),
-		}, nil
-	}
-
-	return &aesEncDec{hash: h, w: w,
-		stream: cipher.NewCFBEncrypter(block, iv),
-	}, nil
-}
-
-func (aes *aesEncDec) Write(p []byte) (int, error) {
-	aes.hash.Write(p) // 计算加密前的源文件hash
+func (aes *aesEncDec) Write(p []byte) (n int, err error) {
 	aes.stream.XORKeyStream(p, p)
-	return aes.w.Write(p)
+	n, err = aes.w.Write(p)
+	if err == nil {
+		aes.hash.Write(p[:n]) // 加密后的数据计算hash
+	}
+	return
 }
 
 func (aes *aesEncDec) Read(p []byte) (n int, err error) {
@@ -164,8 +160,8 @@ func (aes *aesEncDec) Read(p []byte) (n int, err error) {
 			n = lc
 		}
 		if n > 0 {
+			aes.hash.Write(p[:n]) // 解密前的数据计算hash
 			aes.stream.XORKeyStream(p, p[:n])
-			aes.hash.Write(p[:n]) // 解密并写入hash流
 		}
 	}
 	return
