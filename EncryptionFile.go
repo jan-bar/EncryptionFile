@@ -43,6 +43,7 @@ func EncData(r io.Reader, w io.Writer, pubKey []byte, h hash.Hash) error {
 	if err != nil {
 		return err
 	}
+	h.Write(head) // 头部也计入hash
 
 	block, err := aes.NewCipher(tmp[:32])
 	if err != nil {
@@ -58,10 +59,9 @@ func EncData(r io.Reader, w io.Writer, pubKey []byte, h hash.Hash) error {
 		return err
 	}
 
-	// hash值为加密后数据的hash,这样可以保证每次hash值都会变化
-	// 上一版是加密前数据的hash,这样可以穷举aes的key+iv计算和hash匹配就能完成破解
-	// 所以使用加密后数据计算hash是最合理的方式
-	_, err = w.Write(aw.sum()) // 最后写入内容hash值
+	// 该hash为加密后全部数据包含头部数据的hash,且是加密后的hash不仅防损坏和篡改
+	// 也防止了穷举秘钥匹配hash,这是上一版存在的问题
+	_, err = w.Write(aw.sum())
 	return err
 }
 
@@ -81,6 +81,7 @@ func DecData(r io.Reader, w io.Writer, priKey []byte, h hash.Hash) error {
 	if err != nil {
 		return err
 	}
+	h.Write(tmp[:2])
 
 	n := int(tmp[0]) | int(tmp[1])<<8
 	if n > bufLen {
@@ -92,6 +93,7 @@ func DecData(r io.Reader, w io.Writer, priKey []byte, h hash.Hash) error {
 	if err != nil {
 		return err
 	}
+	h.Write(tmp[:n])
 
 	key, err := RsaDecrypt(priKey, tmp[:n])
 	if err != nil {
@@ -134,7 +136,7 @@ type aesEncDec struct {
 func (aes *aesEncDec) Write(p []byte) (n int, err error) {
 	aes.stream.XORKeyStream(p, p)
 	n, err = aes.w.Write(p)
-	if err == nil {
+	if n > 0 {
 		aes.hash.Write(p[:n]) // 加密后的数据计算hash
 	}
 	return
@@ -173,11 +175,12 @@ func (aes *aesEncDec) sum() []byte { return aes.hash.Sum(nil) }
 // 解密时判断计算的hash和读出的hash是否不同
 func (aes *aesEncDec) sumDiff() bool {
 	crc := aes.hash.Sum(nil)
-	if len(crc) == len(aes.hCrc) {
-		for i, v := range crc {
-			if aes.hCrc[i] != v {
-				return true
-			}
+	if len(crc) != len(aes.hCrc) {
+		return true
+	}
+	for i, v := range crc {
+		if aes.hCrc[i] != v {
+			return true
 		}
 	}
 	return false
