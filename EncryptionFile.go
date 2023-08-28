@@ -13,19 +13,24 @@ import (
 	"io"
 )
 
-const bufLen = 32 * 1024 // 同io.Copy里面的默认长度
+const (
+	bufLen = 32 * 1024 // 同io.Copy里面的默认长度
+
+	aesKeySize  = 32 // AES-256
+	aesKeyIvLen = aesKeySize + aes.BlockSize
+)
 
 // EncData
-//  @Description: 加密数据
-//  @param r      数据来源读出流
-//  @param w      加密数据写入流
-//  @param pubKey 公钥数据
-//  @param h      指定hash校验方法
-//  @return error 返回错误
+//
+//	@Description: 加密数据
+//	@param r      数据来源读出流
+//	@param w      加密数据写入流
+//	@param pubKey 公钥数据
+//	@param h      指定hash校验方法
+//	@return error 返回错误
 func EncData(r io.Reader, w io.Writer, pubKey []byte, h hash.Hash) error {
 	tmp := make([]byte, bufLen)
 
-	const aesKeyIvLen = aes.BlockSize + 32
 	_, err := rand.Read(tmp[:aesKeyIvLen])
 	if err != nil {
 		return err
@@ -45,12 +50,12 @@ func EncData(r io.Reader, w io.Writer, pubKey []byte, h hash.Hash) error {
 	}
 	h.Write(head) // 头部也计入hash
 
-	block, err := aes.NewCipher(tmp[:32])
+	block, err := aes.NewCipher(tmp[:aesKeySize])
 	if err != nil {
 		return err
 	}
 	aw := &aesEncDec{hash: h, w: w,
-		stream: cipher.NewCFBEncrypter(block, tmp[32:aesKeyIvLen]),
+		stream: cipher.NewCFBEncrypter(block, tmp[aesKeySize:aesKeyIvLen]),
 	}
 
 	// 将内容使用aes进行加密并写入
@@ -59,19 +64,20 @@ func EncData(r io.Reader, w io.Writer, pubKey []byte, h hash.Hash) error {
 		return err
 	}
 
-	// 该hash为加密后全部数据包含头部数据的hash,且是加密后的hash不仅防损坏和篡改
+	// 该hash为加密后全部数据包含头部数据的hash,且加密后的hash不仅防损坏和篡改
 	// 也防止了穷举秘钥匹配hash,这是上一版存在的问题
 	_, err = w.Write(aw.sum())
 	return err
 }
 
 // DecData
-//  @Description:  解密数据
-//  @param r       密文数据读入流
-//  @param w       解密后数据写入流
-//  @param priKey  私钥数据
-//  @param h       指定hash校验方法
-//  @return error  返回错误
+//
+//	@Description:  解密数据
+//	@param r       密文数据读入流
+//	@param w       解密后数据写入流
+//	@param priKey  私钥数据
+//	@param h       指定hash校验方法
+//	@return error  返回错误
 func DecData(r io.Reader, w io.Writer, priKey []byte, h hash.Hash) error {
 	var (
 		br  = bufio.NewReader(r)
@@ -100,12 +106,16 @@ func DecData(r io.Reader, w io.Writer, priKey []byte, h hash.Hash) error {
 		return err
 	}
 
-	block, err := aes.NewCipher(key[:32])
+	if len(key) != aesKeyIvLen {
+		return errors.New("len(key) != aesKeyIvLen")
+	}
+
+	block, err := aes.NewCipher(key[:aesKeySize])
 	if err != nil {
 		return err
 	}
 	ar := &aesEncDec{hash: h, r: br, hSize: h.Size(),
-		stream: cipher.NewCFBDecrypter(block, key[32:]),
+		stream: cipher.NewCFBDecrypter(block, key[aesKeySize:]),
 	}
 
 	// 使用aes解密,并写入w
@@ -123,14 +133,12 @@ func DecData(r io.Reader, w io.Writer, priKey []byte, h hash.Hash) error {
 // -----------------------------------------------------------------------------
 
 type aesEncDec struct {
-	r *bufio.Reader
-	w io.Writer
-
-	hash  hash.Hash
-	hSize int
-	hCrc  []byte
-
+	w      io.Writer
+	hash   hash.Hash
 	stream cipher.Stream
+	r      *bufio.Reader
+	hCrc   []byte
+	hSize  int
 }
 
 func (aes *aesEncDec) Write(p []byte) (n int, err error) {
@@ -146,10 +154,12 @@ func (aes *aesEncDec) Read(p []byte) (n int, err error) {
 	n, err = aes.r.Read(p)
 	if err == nil {
 		aes.hCrc, err = aes.r.Peek(aes.hSize)
-		if err != nil {
+		switch err {
+		case nil:
+		case io.EOF:
 			// Peek只有读n个字节才会返回成功,只有少于n个字节才会报错
 			// 因此上次Peek成功,则说明缓存一定有n个字节可读
-			// 因为 (len(p)=32*1024) > aes.hSize ,本次Read一定包含上次Peek内容
+			// 因为 (len(p)=bufLen) > aes.hSize ,本次Read一定包含上次Peek内容
 			// 本次Peek失败,说明读取到io.EOF结束标记,本次读取就完成了所有读取
 			// 此时(p + aes.hCrc)共同组成包含crc内容的最后一次处理数据
 			// len(aes.hCrc) == aes.hSize时err==nil,会多走一次循环,下次才会到这里
@@ -160,7 +170,10 @@ func (aes *aesEncDec) Read(p []byte) (n int, err error) {
 			lc := n - aes.hSize + len(aes.hCrc)
 			aes.hCrc = append(p[lc:n], aes.hCrc...)
 			n = lc
+		default:
+			return
 		}
+
 		if n > 0 {
 			aes.hash.Write(p[:n]) // 解密前的数据计算hash
 			aes.stream.XORKeyStream(p, p[:n])
@@ -189,11 +202,12 @@ func (aes *aesEncDec) sumDiff() bool {
 // -----------------------------------------------------------------------------
 
 // GenRsaKey
-//  @Description: 生成rsa公私钥对
-//  @param bits   生成位数
-//  @param pub    公钥写入流
-//  @param pri    私钥写入流
-//  @return error 返回错误
+//
+//	@Description: 生成rsa公私钥对
+//	@param bits   生成位数
+//	@param pub    公钥写入流
+//	@param pri    私钥写入流
+//	@return error 返回错误
 func GenRsaKey(bits int, pub, pri io.Writer) error {
 	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
 	if err != nil {
@@ -223,11 +237,12 @@ func GenRsaKey(bits int, pub, pri io.Writer) error {
 }
 
 // RsaEncrypt
-//  @Description:   rsa加密逻辑
-//  @param pubKey    公钥数据
-//  @param origData  待加密数据
-//  @return []byte   返回加密后数据
-//  @return error    返回错误
+//
+//	@Description:   rsa加密逻辑
+//	@param pubKey    公钥数据
+//	@param origData  待加密数据
+//	@return []byte   返回加密后数据
+//	@return error    返回错误
 func RsaEncrypt(pubKey, origData []byte) ([]byte, error) {
 	block, _ := pem.Decode(pubKey)
 	if block == nil {
@@ -241,11 +256,12 @@ func RsaEncrypt(pubKey, origData []byte) ([]byte, error) {
 }
 
 // RsaDecrypt
-//  @Description:     rsa解密逻辑
-//  @param priKey     私钥数据
-//  @param cipherText 密文
-//  @return []byte    解密后数据
-//  @return error     返回错误
+//
+//	@Description:     rsa解密逻辑
+//	@param priKey     私钥数据
+//	@param cipherText 密文
+//	@return []byte    解密后数据
+//	@return error     返回错误
 func RsaDecrypt(priKey, cipherText []byte) ([]byte, error) {
 	block, _ := pem.Decode(priKey)
 	if block == nil {

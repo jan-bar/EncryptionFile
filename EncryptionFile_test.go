@@ -77,8 +77,8 @@ func TestEnc(t *testing.T) {
 }
 
 type limitReader struct {
-	n int
 	r io.Reader
+	n int
 }
 
 func (l *limitReader) Read(p []byte) (int, error) {
