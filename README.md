@@ -1,17 +1,57 @@
 ## EncryptionFile
 
-> 加密解密文件  
-> 由于需要使用流式加解密因此选用AES CFB模式  
-> 使用RSA将随机密钥加密,并将密文存入文件头部  
-> 加密文件只需要提供程序和公钥  
-> 解密文件只需要提供程序和私钥  
-> 相同文件每次加密结果都不一样,安全系数极高  
-> 可以指定计算hash算法,最终会在末尾存入hash值  
+[中文文档](README_CN.md)
 
-加密后数据内容如下,随机生成`key, iv`,不用私钥解密谁也不知道这两个的值
+for specific usage, please read: [EncryptionFile_test.go](EncryptionFile_test.go)
 
-为了让加解密都使用io.Reader和io.Writer,将hash放在末尾,读取文件需要正确处理尾部hash
+### implementation
 
-| rsa密文长度            | rsa加密aes密码后的密文 | aes加密内容   | 数据hash值                                              |
-|--------------------|----------------|-----------|------------------------------------------------------|
-| len(rsa(key + iv)) | rsa(key + iv)  | aes(data) | hash(len(rsa(key + iv)) + rsa(key + iv) + aes(data)) |
+the password is related to the corresponding algorithm
+
+I have this format here: `password = [key + 0 + iv/nonce]`
+
+| rsa ciphertext length | rsa encrypted password data | algorithm encrypted content | hash value                                                        |
+|-----------------------|-----------------------------|-----------------------------|-------------------------------------------------------------------|
+| len(rsa(password))    | rsa(password)               | algorithm(content)          | hash.Sum(len(rsa(password)) + rsa(password) + algorithm(content)) |
+
+### cipher.AEAD
+
+password composition: `password = [key + 0 + nonce]`
+
+the nonce needs to be taken out correctly, and it must be ensured that there is no 0 in the key
+
+### cipher.Stream
+
+password composition: `password = [key + 0 + iv]`
+
+### cipher.BlockMode
+
+password composition: `password = [key + 0 + iv]`
+
+### example
+
+support encryption schemes in golang standard library: `cipher.AEAD,cipher.Stream,cipher.BlockMode`
+
+at the same time, several encryption schemes of aes are built in: `CFB,CTR,OFB,CBC,GCM`
+
+```go
+// an encryption scheme can be specified with the built-in method
+// GenEncCipher(cipher.NewCFBEncrypter)
+// GenEncCipher(cipher.NewCTR)
+// GenEncCipher(cipher.NewOFB)
+// GenEncCipher(cipher.NewCBCEncrypter)
+// GenEncCipher(cipher.NewGCM)
+EncData(Reader, Writer, pubKey, md5.New(), GenEncCipher(cipher.NewCFBEncrypter))
+
+// an decryption scheme can be specified with the built-in method
+// GenDecCipher(cipher.NewCFBDecrypter)
+// GenDecCipher(cipher.NewCTR)
+// GenDecCipher(cipher.NewOFB)
+// GenDecCipher(cipher.NewCBCDecrypter)
+// GenDecCipher(cipher.NewGCM)
+DecData(Reader, Writer, priKey, md5.New(), GenDecCipher(cipher.NewCFBDecrypter))
+```
+
+you can also refer to [GenEncCipher](EncryptionFile.go#GenEncCipher) to write the method of generating encryption
+
+you can also refer to [GenDecCipher](EncryptionFile.go#GenDecCipher) to write the method of generating decryption
