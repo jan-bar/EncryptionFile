@@ -26,14 +26,14 @@ type (
 
 // EncData
 //
-//	@Description: encrypted data
-//	@param r      data source read stream
-//	@param w      encrypted data is written to the stream
-//	@param pubKey public key data
-//	@param h      specify the hash verification method
-//	@param gen    EncCipher, generate key and specify encryption algorithm
+//	@Description:  encrypted data
+//	@param r       data source read stream
+//	@param w       encrypted data is written to the stream
+//	@param encMode public key or encryption function
+//	@param h       specify the hash verification method
+//	@param gen     EncCipher, generate key and specify encryption algorithm
 //	@return error
-func EncData(r io.Reader, w io.Writer, pubKey []byte, h hash.Hash, gen EncCipher) error {
+func EncData(r io.Reader, w io.Writer, encMode any, h hash.Hash, gen EncCipher) error {
 	tmp := make([]byte, bufLen)
 
 	// ensure that the data and cipher algorithm objects are legal
@@ -42,7 +42,17 @@ func EncData(r io.Reader, w io.Writer, pubKey []byte, h hash.Hash, gen EncCipher
 		return err
 	}
 
-	encKey, err := RsaEncrypt(pubKey, data)
+	var encKey []byte
+	switch mode := encMode.(type) {
+	case []byte:
+		encKey, err = RsaEncrypt(mode, data)
+	case string:
+		encKey, err = RsaEncrypt([]byte(mode), data)
+	case func([]byte) ([]byte, error):
+		encKey, err = mode(data)
+	default:
+		return errors.New("encMode not support")
+	}
 	if err != nil {
 		return err
 	}
@@ -112,11 +122,11 @@ func EncData(r io.Reader, w io.Writer, pubKey []byte, h hash.Hash, gen EncCipher
 //	@Description:  decrypt data
 //	@param r       ciphertext data read stream
 //	@param w       the decrypted data is written to the stream
-//	@param priKey  private key data
+//	@param devMode private key data or decryption function
 //	@param h       specify the hash verification method
 //	@param gen     DecCipher, verify and generate a decryption algorithm based on the key
 //	@return error
-func DecData(r io.Reader, w io.Writer, priKey []byte, h hash.Hash, gen DecCipher) error {
+func DecData(r io.Reader, w io.Writer, decMode any, h hash.Hash, gen DecCipher) error {
 	tmp := make([]byte, bufLen)
 
 	_, err := io.ReadFull(r, tmp[:2])
@@ -138,7 +148,17 @@ func DecData(r io.Reader, w io.Writer, priKey []byte, h hash.Hash, gen DecCipher
 
 	h.Write(tmp[:n])
 
-	data, err := RsaDecrypt(priKey, tmp[:n])
+	var data []byte
+	switch mode := decMode.(type) {
+	case []byte:
+		data, err = RsaDecrypt(mode, tmp[:n])
+	case string:
+		data, err = RsaDecrypt([]byte(mode), tmp[:n])
+	case func([]byte) ([]byte, error):
+		data, err = mode(tmp[:n])
+	default:
+		return errors.New("decMode not support")
+	}
 	if err != nil {
 		return err
 	}
@@ -239,13 +259,13 @@ func GenEncCipher(enc any) EncCipher {
 
 		switch e := enc.(type) {
 		case func(cipher.Block) (cipher.AEAD, error):
-			aead, err := e(block)
+			ad, err := e(block)
 			if err != nil {
 				return nil, nil, err
 			}
 
-			gen = aead
-			add(aead.NonceSize()) // nonce
+			gen = ad
+			add(ad.NonceSize()) // nonce
 		case func(cipher.Block, []byte) cipher.Stream:
 			gen = e(block, add(block.BlockSize())) // iv
 		case func(cipher.Block, []byte) cipher.BlockMode:
@@ -275,12 +295,12 @@ func GenDecCipher(dec any) DecCipher {
 
 		switch d := dec.(type) {
 		case func(cipher.Block) (cipher.AEAD, error):
-			aead, err := d(block)
+			ad, err := d(block)
 			if err != nil {
 				return nil, err
 			}
 
-			gen = aead // subsequent verification of nonce by read nonce
+			gen = ad // subsequent verification of nonce by read nonce
 		case func(cipher.Block, []byte) cipher.Stream:
 			if len(info) != block.BlockSize() {
 				return nil, errors.New("len(iv) error")
@@ -473,6 +493,7 @@ func (bc *blockCipher) Close() error {
 
 // -----------------------------------------------------------------------------
 
+//goland:noinspection SpellCheckingInspection
 type aeadCipher struct {
 	r     io.Reader
 	w     io.Writer
@@ -724,9 +745,7 @@ func RsaDecrypt(priKey, cipherText []byte) ([]byte, error) {
 func WriteFull(w io.Writer, b []byte) (n int, err error) {
 	var now int
 
-	max := len(b)
-
-	for n < max {
+	for n < len(b) {
 		now, err = w.Write(b[n:])
 		if err != nil {
 			return
